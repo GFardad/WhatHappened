@@ -1,0 +1,16 @@
+# Build artefacts
+/wh
+/dist/
+*.test
+*.out
+
+# Saved captures: never commit terminal output, it contains secrets
+/captures/
+*.ansi
+events.jsonl
+stream.ansi
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

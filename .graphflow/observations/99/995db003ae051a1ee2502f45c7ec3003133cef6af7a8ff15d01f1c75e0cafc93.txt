@@ -1,0 +1,370 @@
+<path>/home/gfardad/.dsh/skills/orchestra/scripts/batch5.js</path>
+<type>file</type>
+<content>
+1: // ============================================================================
+2: // GVS5H-5 — deterministic 5-role batch protocol
+3: // ============================================================================
+4: // One batch = 5 ROLES (the user may read "5 subagents" either way; roles are
+5: // the stable unit, invocations repeat inside the repair loop):
+6: //
+7: //   G1 G2 G3  gatherers  — read spec + local code + context7 + websearch
+8: //                          (run in parallel)
+9: //   B1 B2 B3  debaters   — argue the approach from the gathered evidence; run
+10: //                          CONCURRENTLY with the doer's draft pass
+11: //   D          doer       — drafts the approach, then implements it
+12: //   R1 R2 R3  reviewers  — audit the finished work
+13: //   E          e2e        — end-to-end verification as code AND as a user
+14: //
+15: // Five role families (gather / debate / do / review / e2e). G, B and R each run
+16: // 3 seats, so one batch is 3+3+1+3+1 = 11 agent invocations per iteration.
+17: //
+18: // Timeline of one batch (all stages are per-item, no cross-batch barrier):
+19: //
+20: //   gather(x3, parallel)
+21: //        |
+22: //        +--> doer DRAFT  .............. running in parallel with ...
+23: //        |                              debate(x3, parallel)
+24: //        +--> doer FINAL (sees gathered findings + debate conclusions)
+25: //                  |
+26: //                  +--> review(x3) + e2e(1)   [parallel]
+27: //                          |
+28: //                    any failure? --> repair D --> review again  (loop)
+29: //                          |
+30: //                    all clean --> batch done
+31: //
+32: // args (JSON, passed by the Manager):
+33: //   {
+34: //     spec: string,            // the spec-kit text every agent must obey
+35: //     batches: [{ id, title, focus, paths?: string[] }],
+36: //     maxIterations?: number,  // repair-loop ceiling, default 3
+37: //     debateRounds?: number    // reserved, default 1
+38: //   }
+39: //
+40: // Returns: { batches: [...], stats: {...} }
+41: // ============================================================================
+42: 
+43: const A = args || {};
+44: const SPEC = String(A.spec || "(no spec supplied — derive scope from the batch title/focus)");
+45: // Normalize args.batches. Some transports deliver a JSON array as a
+46: // single-key object ({item: {...}} / {"0": {...}}) instead of a real array, so
+47: // accept every shape that still identifies exactly one batch per entry.
+48: function normalizeBatches(raw) {
+49:   if (raw === undefined || raw === null) return [];
+50:   if (Array.isArray(raw)) return raw.filter((x) => x && typeof x === "object");
+51:   if (typeof raw === "object") {
+52:     // An object carrying a batch `id`/`title` is one batch.
+53:     if (raw.id !== undefined || raw.title !== undefined) return [raw];
+54:     const keys = Object.keys(raw);
+55:     // Keys that look like an unwrapped array: "0","1",... or a lone "item".
+56:     const isIndexish = keys.every((k) => k === "item" || /^\d+$/.test(k));
+57:     if (isIndexish && keys.length > 0) {
+58:       return keys
+59:         .sort((a, b) => (a === "item" ? -1 : b === "item" ? 1 : Number(a) - Number(b)))
+60:         .map((k) => raw[k])
+61:         .filter((x) => x && typeof x === "object");
+62:     }
+63:   }
+64:   return [];
+65: }
+66: // A batch is only usable if it names itself and states what to do. Anything
+67: // else (a transport-mangled wrapper, an empty entry) is dropped loudly rather
+68: // than becoming a silent no-op batch that fails deep inside the pipeline.
+69: function usable(b) {
+70:   return !!(b && typeof b === "object" && (b.id !== undefined || b.title !== undefined) &&
+71:             (typeof b.focus === "string" ? b.focus.trim().length > 0 : false));
+72: }
+73: const RAW_BATCHES = normalizeBatches(A.batches);
+74: const DROPPED = RAW_BATCHES.filter((b) => !usable(b)).length;
+75: const BATCHES = RAW_BATCHES.filter(usable);
+76: const MAX_ITER = Number(A.maxIterations || 3);
+77: 
+78: if (BATCHES.length === 0) {
+79:   return { batches: [], stats: { error: "args.batches is empty or malformed (expected an array of {id,title,focus})" } };
+80: }
+81: 
+82: // ── Schemas (object-rooted; only the supported JSON Schema subset) ──────────
+83: const FINDINGS = {
+84:   type: "object",
+85:   properties: {
+86:     findings: { type: "string", description: "What you established, with file/URL citations." },
+87:     facts: { type: "array", items: { type: "string" } },
+88:     risks: { type: "array", items: { type: "string" } },
+89:     proposal: { type: "string", description: "Your recommended approach." },
+90:     openQuestions: { type: "array", items: { type: "string" }, description: "Anything you could not resolve from local/context7/web. Empty if none." },
+91:   },
+92:   required: ["findings", "proposal", "openQuestions"],
+93:   additionalProperties: false,
+94: };
+95: 
+96: const DEBATE = {
+97:   type: "object",
+98:   properties: {
+99:     position: { type: "string", description: "Your argued position on how this must be done." },
+100:     objections: { type: "array", items: { type: "string" }, description: "Where the other positions are wrong or risky." },
+101:     verdict: { type: "string", description: "The concrete instruction the doer must follow." },
+102:   },
+103:   required: ["position", "objections", "verdict"],
+104:   additionalProperties: false,
+105: };
+106: 
+107: const WORK = {
+108:   type: "object",
+109:   properties: {
+110:     summary: { type: "string", description: "What you actually changed/did." },
+111:     filesTouched: { type: "array", items: { type: "string" } },
+112:     howToVerify: { type: "string", description: "Exact commands/steps a reviewer must run, and what output proves it works." },
+113:     notDone: { type: "array", items: { type: "string" }, description: "Anything left incomplete, with reason." },
+114:     blockedOn: { type: "array", items: { type: "string" }, description: "Questions only the Manager/user can answer. Empty if none." },
+115:   },
+116:   required: ["summary", "howToVerify", "notDone", "blockedOn"],
+117:   additionalProperties: false,
+118: };
+119: 
+120: const REVIEW = {
+121:   type: "object",
+122:   properties: {
+123:     verdict: { type: "string", enum: ["pass", "fail"] },
+124:     severity: { type: "string", enum: ["none", "minor", "major", "blocker"] },
+125:     issues: { type: "array", items: { type: "string" }, description: "Concrete defects with file:line and the fix required." },
+126:     evidence: { type: "string", description: "What you ran/read that proves your verdict." },
+127:   },
+128:   required: ["verdict", "severity", "issues", "evidence"],
+129:   additionalProperties: false,
+130: };
+131: 
+132: // ── Helpers ─────────────────────────────────────────────────────────────────
+133: function specBlock() {
+134:   return "=== SPEC (binding) ===\n" + SPEC + "\n=== END SPEC ===\n";
+135: }
+136: function batchBlock(b) {
+137:   const paths = b.paths && b.paths.length ? "\nRelevant paths: " + b.paths.join(", ") : "";
+138:   return "Batch " + b.id + ": " + b.title + "\nFocus: " + b.focus + paths + "\n";
+139: }
+140: function cite(items) {
+141:   if (!items || !items.length) return "(nothing returned)";
+142:   return items
+143:     .map((x, i) => "[" + (i + 1) + "] " + (x && x.findings ? x.findings : JSON.stringify(x)))
+144:     .join("\n\n");
+145: }
+146: function toolchain() {
+147:   return [
+148:     "Toolchain — use what the batch actually needs:",
+149:     "- local repo: read/grep/glob/bash to inspect and change real files;",
+150:     "- mcp__websearch__web_search + mcp__websearch__read_page for current docs/facts;",
+151:     "- camofox (mcp__camofox__*) when a page is bot-walled, JS-only, or you must interact with a real UI;",
+152:     "- context7 (mcp__context7__*) when a library's current API matters.",
+153:     "You are a batch member: you do NOT spawn subagents (those tools are disabled for you).",
+154:   ].join("\n");
+155: }
+156: function asArray(x) {
+157:   return Array.isArray(x) ? x.filter((v) => v) : [];
+158: }
+159: 
+160: // ── Stage: gather (3 in parallel) ───────────────────────────────────────────
+161: function gatherStage(b, seat) {
+162:   return agent(
+163:     specBlock() +
+164:       batchBlock(b) +
+165:       "You are GATHERER " + (seat + 1) + " of 3 for batch " + b.id + ". Your only job is EVIDENCE.\n\n" +
+166:       "Read the spec, then investigate this batch's focus using: the local codebase (read/grep/glob), " +
+167:       "context7 for library APIs, and websearch for current docs. Establish what is TRUE today — " +
+168:       "do not guess and do not propose implementation yet beyond a sketch.\n\n" +
+169:       toolchain() +
+170:       "\n\nReturn findings with citations (file paths, doc URLs). Put anything you could NOT resolve in openQuestions.",
+171:     { schema: FINDINGS, label: "b" + b.id + ":gather", phase: "gather" }
+172:   );
+173: }
+174: 
+175: // ── Stage: draft ‖ debate (true concurrency: draft runs while debaters debate) ──
+176: function draftStage(b, gathered) {
+177:   return agent(
+178:     specBlock() +
+179:       batchBlock(b) +
+180:       "You are the DOER for this batch. A debate is running in parallel right now; you will receive its " +
+181:       "conclusions before you finalise. For now: read the evidence below and DRAFT your concrete plan " +
+182:       "(files to touch, approach, verification steps). Do not implement yet.\n\n" +
+183:       "EVIDENCE FROM GATHERERS:\n" + cite(gathered) + "\n\n" + toolchain(),
+184:     { schema: WORK, label: "b" + b.id + ":draft", phase: "draft" }
+185:   );
+186: }
+187: 
+188: function debateStage(b, gathered, seat) {
+189:   // Seat identity is carried on the record itself: filtering by array index
+190:   // would cross-link debaters whenever an earlier gatherer returned null and
+191:   // the filtered array shifted.
+192:   const others = gathered.filter((g) => !g || g.__seat !== seat);
+193:   return agent(
+194:     specBlock() +
+195:       batchBlock(b) +
+196:       "You are DEBATER " + (seat + 1) + " of 3 for this batch. The other gatherers reported:\n" +
+197:       cite(others) +
+198:       "\n\nArgue how this must be done: pick the approach, attack the other positions' weak points, and end with a " +
+199:       "VERDICT — the concrete instruction the doer must follow. Prefer correctness and testability over elegance. " +
+200:       "You have full tools; verify claims against the real repo before you assert them. Do not implement anything.",
+201:     { schema: DEBATE, label: "b" + b.id + ":debate" + (seat + 1), phase: "debate" }
+202:   );
+203: }
+204: 
+205: // ── Stage: final implement (sees gathered + debate) ──────────────────────────
+206: function finalStage(b, draft, gathered, debated) {
+207:   const verdicts = debated.filter(Boolean).map((d, i) => "Debater " + (i + 1) + " verdict: " + d.verdict).join("\n");
+208:   return agent(
+209:     specBlock() +
+210:       batchBlock(b) +
+211:       "You are the DOER for this batch. Implement it now, for real, in the repo.\n\n" +
+212:       "YOUR DRAFT:\n" + (draft ? draft.summary : "(draft unavailable)") + "\n\n" +
+213:       "DEBATE VERDICTS (binding):\n" + (verdicts || "(debate unavailable — use your judgement)") + "\n\n" +
+214:       "GATHERED EVIDENCE:\n" + cite(gathered) + "\n\n" +
+215:       "RULES:\n" +
+216:       "- Follow the spec exactly. The verdicts override your draft where they conflict.\n" +
+217:       "- ACTUALLY EDIT THE FILES. A plan without edits is a failed batch.\n" +
+218:       "- Then verify by running the project's own tests/build/lint (bash). Report the real command and real output in howToVerify.\n" +
+219:       "- If something only the Manager/user can decide goes wrong, put it in blockedOn.\n\n" + toolchain(),
+220:     { schema: WORK, label: "b" + b.id + ":implement", phase: "implement" }
+221:   );
+222: }
+223: 
+224: // ── Stage: review (3 reviewers + 1 e2e, parallel) ───────────────────────────
+225: function reviewStage(b, work, seat) {
+226:   const base =
+227:     specBlock() + batchBlock(b) +
+228:     "THE DOER'S REPORT:\nsummary: " + (work ? work.summary : "(none)") +
+229:     "\nfiles: " + (work ? JSON.stringify(work.filesTouched || []) : "[]") +
+230:     "\nhowToVerify: " + (work ? work.howToVerify : "(none)") +
+231:     "\nnotDone: " + (work ? JSON.stringify(work.notDone || []) : "[]") + "\n\n";
+232:   if (seat < 3) {
+233:     return agent(
+234:       base +
+235:         "You are REVIEWER " + (seat + 1) + " of 3. Audit the actual work in the repo — open the changed files, " +
+236:         "run the tests yourself, and hunt for: wrong logic, missed spec requirements, broken edge cases, " +
+237:         "unhandled errors, security issues, and claims the doer did not actually verify. " +
+238:         "Do NOT trust the report — check it. verdict=fail if you find ANY real defect.\n\n" + toolchain(),
+239:       { schema: REVIEW, label: "b" + b.id + ":review" + (seat + 1), phase: "review" }
+240:     );
+241:   }
+242:   return agent(
+243:     base +
+244:       "You are the END-TO-END reviewer. Everything must work BOTH as code AND as a user:\n" +
+245:       "- As code: run the full test/build/lint suite yourself; fix nothing, only report.\n" +
+246:       "- As a user: exercise the real flow end-to-end. If it is a web app, drive it with camofox " +
+247:       "(create_tab → snapshot → click/type/press → screenshot) and confirm it actually works, not just renders. " +
+248:       "If it is a CLI/library, run it for real and check the output a user would see.\n" +
+249:       "Anything untested or broken = verdict=fail with the exact reproduction. Do not rubber-stamp.\n\n" + toolchain(),
+250:     { schema: REVIEW, label: "b" + b.id + ":e2e", phase: "review" }
+251:   );
+252: }
+253: 
+254: // ── Stage: repair ───────────────────────────────────────────────────────────
+255: function repairStage(b, work, reviews) {
+256:   const fails = reviews.filter(Boolean).filter((r) => r.verdict === "fail");
+257:   const lines = fails.map((r, i) => "[" + (i + 1) + "] (" + r.severity + ") " + r.issues.join(" | "));
+258:   return agent(
+259:     specBlock() +
+260:       batchBlock(b) +
+261:       "Reviewers REJECTED your work. Fix every issue below, for real, then re-verify with the project's own commands.\n\n" +
+262:       "FAILURES:\n" + (lines.join("\n") || "(reviewers failed without detail — re-verify from scratch)") + "\n\n" +
+263:       "PREVIOUS ATTEMPT:\n" + (work ? work.summary : "(none)") + "\n\n" +
+264:       "Do not stop at a plan. Edit the files and prove the fix with real command output. " +
+265:       "If an issue is genuinely unfixable without a user decision, put it in blockedOn.",
+266:     { schema: WORK, label: "b" + b.id + ":repair", phase: "repair" }
+267:   );
+268: }
+269: 
+270: // ══ THE BATCH — one pipeline item, no barrier between batches ═══════════════
+271: async function runBatch(b) {
+272:   log("batch " + b.id + ": gather");
+273: 
+274:   // 1) Gather x3, parallel.
+275:   const gatheredRaw = await parallel([0, 1, 2].map((i) => () => gatherStage(b, i)));
+276:   // Tag each surviving gatherer with its seat so debate can exclude the right one.
+277:   const gathered = [];
+278:   for (let i = 0; i < gatheredRaw.length; i++) {
+279:     const g = gatheredRaw[i];
+280:     if (g) gathered.push(Object.assign({ __seat: i }, g));
+281:   }
+282:   if (gathered.length === 0) {
+283:     return { id: b.id, title: b.title, status: "failed", reason: "all gatherers failed", iteration: 0 };
+284:   }
+285: 
+286:   // Surface questions the batch could not resolve — Manager handles these.
+287:   const openQuestions = [];
+288:   for (const g of gathered) for (const q of asArray(g.openQuestions)) if (openQuestions.indexOf(q) === -1) openQuestions.push(q);
+289: 
+290:   log("batch " + b.id + ": draft ‖ debate");
+291:   // 2) Draft and debate genuinely run at the same time: start draft (not awaited),
+292:   //    then run the 3 debaters, then collect the draft.
+293:   const draftPromise = draftStage(b, gathered);
+294:   const debated = (await parallel([0, 1, 2].map((i) => () => debateStage(b, gathered, i)))).filter(Boolean);
+295:   const draft = await draftPromise;
+296: 
+297:   // 3) Final implement.
+298:   log("batch " + b.id + ": implement");
+299:   let work = await finalStage(b, draft, gathered, debated);
+300:   if (!work) {
+301:     return { id: b.id, title: b.title, status: "failed", reason: "doer produced no result", iteration: 0, openQuestions };
+302:   }
+303: 
+304:   // 4) Review loop: reviewers + e2e must ALL pass.
+305:   let iteration = 0;
+306:   let reviews = [];
+307:   while (iteration < MAX_ITER) {
+308:     iteration += 1;
+309:     log("batch " + b.id + ": review round " + iteration);
+310:     reviews = (await parallel([0, 1, 2, 3].map((seat) => () => reviewStage(b, work, seat)))).filter(Boolean);
+311:     const failures = reviews.filter((r) => r.verdict === "fail");
+312:     if (failures.length === 0 && reviews.length === 4) {
+313:       return {
+314:         id: b.id, title: b.title, status: "clean", iteration,
+315:         summary: work.summary, filesTouched: work.filesTouched || [],
+316:         howToVerify: work.howToVerify, reviews: reviews.map((r) => ({ verdict: r.verdict, severity: r.severity })),
+317:         blockedOn: work.blockedOn || [], openQuestions,
+318:       };
+319:     }
+320:     if (iteration >= MAX_ITER) {
+321:       return {
+322:         id: b.id, title: b.title, status: "unresolved", iteration,
+323:         summary: work.summary, filesTouched: work.filesTouched || [],
+324:         remaining: failures.map((f) => ({ severity: f.severity, issues: f.issues })),
+325:         reviews: reviews.map((r) => ({ verdict: r.verdict, severity: r.severity })),
+326:         blockedOn: work.blockedOn || [], openQuestions,
+327:       };
+328:     }
+329:     // Failed -> hand the failures back to the doer and loop.
+330:     log("batch " + b.id + ": repair (round " + iteration + ")");
+331:     const repaired = await repairStage(b, work, reviews);
+332:     if (!repaired) return { id: b.id, title: b.title, status: "failed", reason: "repair produced no result", iteration, openQuestions };
+333:     work = repaired;
+334:   }
+335:   return { id: b.id, title: b.title, status: "unresolved", reason: "loop exited", iteration, openQuestions };
+336: }
+337: 
+338: // ══ DRIVE ALL BATCHES IN PARALLEL ══════════════════════════════════════════
+339: phase("batches");
+340: const results = await pipeline(BATCHES, async (b) => await runBatch(b));
+341: 
+342: const clean = results.filter((r) => r && r.status === "clean");
+343: const unresolved = results.filter((r) => r && r.status === "unresolved");
+344: const failed = results.filter((r) => r && r.status === "failed");
+345: 
+346: // Questions only the Manager can answer — surfaced to the user.
+347: const questions = [];
+348: for (const r of results) {
+349:   if (!r) continue;
+350:   for (const q of asArray(r.openQuestions)) if (questions.indexOf(q) === -1) questions.push(q);
+351:   for (const q of asArray(r.blockedOn)) if (questions.indexOf(q) === -1) questions.push(q);
+352: }
+353: 
+354: return {
+355:   batches: results.filter(Boolean),
+356:   questions,
+357:   stats: {
+358:     total: BATCHES.length,
+359:     clean: clean.length,
+360:     unresolved: unresolved.length,
+361:     failed: failed.length,
+362:     maxIterations: MAX_ITER,
+363:   },
+364: };
+
+(End of file - total 364 lines)
+</content>
